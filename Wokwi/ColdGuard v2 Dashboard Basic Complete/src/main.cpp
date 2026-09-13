@@ -1,0 +1,905 @@
+//Arduino library for PlatformIO
+#include <Arduino.h>
+
+//include the DHTesp Library
+//This library allows the ESP32 to communicate with the DHT22
+//temperature and humidity sensor.
+#include <DHTesp.h>
+
+//Include the I2C LCD library.
+//This allows the ESP32 to display information
+//on the 16x2 LCD screen.
+#include <LiquidCrystal_I2C.h>
+
+//Wi-Fi library built into the ESP32 framework. 
+#include <WiFi.h>
+
+//Allows us to create an encrypted TLS connection
+//to Adafruit IO.
+#include <WiFiClientSecure.h>
+
+//Libary for MQTT client 
+#include <PubSubClient.h>
+
+//WIFI SETTINGS
+//Wokwi provides this virtual Wi-Fi network.
+const char* WIFI_SSID = "Wokwi-GUEST";
+
+//ADAFRUIT IO MQTT SETTINGS
+//Adafruit IO MQTT broker.
+const char* MQTT_SERVER = "io.adafruit.com";
+
+//Secure MQTT/TLS port.
+const int MQTT_PORT = 8883;
+
+//Adafruit IO username for Dashboard.
+const char* AIO_USERNAME = "";
+
+//Adafruit IO key. 
+const char* AIO_KEY = "";
+
+//Wokwi-GUEST does not require a password.
+const char* WIFI_PASSWORD = "";
+
+//ADAFRUIT IO FEED TOPICS
+//Adafruit IO topic format:
+//username/feeds/feed-key
+//Example: LachlanB/feeds/temperature
+//Topic used to publish temperature readings.
+String temperatureTopic = 
+  String(AIO_USERNAME) + "/feeds/temperature";
+
+//Topic used to publish humidity readings.
+String humidityTopic =
+  String(AIO_USERNAME) + "/feeds/humidity";
+
+//Topic used to publish door status readings.
+String doorTopic =
+  String(AIO_USERNAME) + "/feeds/door";
+
+//Topic used to publish cooling/relay status readings.
+String relayTopic = 
+  String(AIO_USERNAME) + "/feeds/relay";
+
+//Topic used to publish System state readings.
+String stateTopic =
+  String(AIO_USERNAME) + "/feeds/state";
+
+//Topic used to publish System Fault readings.
+String faultTopic =
+  String(AIO_USERNAME) + "/feeds/fault";
+
+//Topic used to publish Recent Events / Stream to Recent Events feed.
+String eventsTopic =
+  String(AIO_USERNAME) + "/feeds/events";
+
+//SENSOR UPDATE TIMER
+//Stores the last time sensor information
+//was printed to the Serial Monitor.
+unsigned long lastSensorUpdate = 0;
+
+//How often we want to print sensor information.
+//2000 milliseconds = 2 seconds.
+const unsigned long SENSOR_INTERVAL = 2000;
+
+//MQTT PUBLISH Timer
+//Stores the last time dashboard telemetry
+//was published to Adafruit IO.
+unsigned long lastMqttPublish = 0;
+
+//Publish dashboard telemtry every 15 seconds.
+const unsigned long MQTT_PUBLISH_INTERVAL = 15000;
+
+//The DHT22 data pin is connected to GPIO 33 on the ESP32
+const int DHT_PIN = 33;
+
+//GPIO pin connected to the analogue output
+//of the photoresistor/LDR module.
+const int LDR_PIN = 34;
+
+//BUZZER PIN
+//GPIO 25 constrols the buzzer.
+//The buzzer provides an audible warning when
+//the fridge door has been left open too long.
+const int BUZZER_PIN = 25;
+
+//DOOR TIMER SETTINGS
+//Maximum time the fridge door can remain open
+//before the buzzer alarm activates.
+//60000 milliseconds = 60 seconds.
+const unsigned long DOOR_OPEN_LIMIT = 60000;
+
+//Stores the time when the door was first opened.
+unsigned long doorOpenedAt = 0;
+
+//Keeps track of whether the door timer is active.
+bool doorTimerRunning = false;
+
+//RGB LED PINS
+
+//Red LED channel.
+const int RGB_RED_PIN = 14;
+
+//Green LED channel.
+const int RGB_GREEN_PIN = 27;
+
+//Blue LED channel.
+const int RGB_BLUE_PIN = 13;
+
+//RELAY PIN
+//GPIO 26 controls the relay module.
+//The relay represents the refrigerator's
+//compressor/cooling system.
+const int RELAY_PIN = 26;
+
+//COOLING CONTROL THRESHOLDS
+//If temperature reaches or exceeds 8.5°C,
+//ColdGuard will turn cooling ON.
+const float COOLING_ON_TEMP = 8.5;
+
+//Once cooling is running, the temperature must fall
+//to 7.5°C before ColdGuard turns cooling OFF.
+//Having seperate ON and OFF thresholds creates
+//hysteresis and prevents rapid delay switching.
+const float COOLING_OFF_TEMP = 7.5;
+
+//Stores the current cooling state.
+//false = cooling OFF
+//true = cooling ON
+//This variable gives the controller state memory.
+bool coolingOn = false;
+
+//Temporary LDR Threshold. 
+//Assumed values are for now:
+// Dark / door closed = 3800
+//Bright / door open = 2000
+//Any value below 2900 will temporrily
+//be treated as the fridge door being open.
+const int LDR_THRESHOLD = 2900;
+
+//Create a DHTesp object called "dht".
+//We use this object to configure and read the DHT22 sensor.
+DHTesp dht;
+
+//LCD DISPLAY
+//Create an LCD object.
+//0x27 = common I2C address used by the Wokwi LCD.
+//16 = number of columns.
+//2 = number of rows.
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+//NETWORK OBJECTS
+//Creates a secure Wi-Fi connection.
+WiFiClientSecure wifiClient;
+
+//Uses that secre connection for MQTT.
+PubSubClient mqttClient(wifiClient);
+
+//FUNCTION: publishEvent
+//Sends a text event to the Adafruit IO events feed.
+void publishEvent(const char* message) {
+
+  bool eventPublishSuccess =
+    mqttClient.publish(
+      eventsTopic.c_str(),
+      message
+    );
+
+
+if (eventPublishSuccess) {
+
+  Serial.print("MQTT Event published: ");
+  Serial.println(message);
+} else {
+
+  Serial.println("MQTT Event publish FAILED");
+}
+}
+//FUNCTION: setRGB
+//Controls the colour of the RGB status LED.
+void setRGB(bool red, bool green, bool blue) {
+
+  //Set the red LED channel.
+  digitalWrite(RGB_RED_PIN, red);
+
+  //Set the green LED channel.
+  digitalWrite(RGB_GREEN_PIN, green);
+
+  //Set the blue LED channel.
+  digitalWrite(RGB_BLUE_PIN, blue);
+}
+
+//FUNCTION: connectWiFi
+//Connects the ESP32 to Wokwi-GUEST.
+
+void connectWiFi() {
+
+  Serial.print("Connecting to Wokwi WiFi");
+
+  //Start the Wi-Fi conenction.
+  //Channel 6 is used by Wokwi-GUEST.
+  WiFi.begin(
+    WIFI_SSID,
+    WIFI_PASSWORD,
+    6
+  );
+
+  //Keep checking until Wi-Fi connects.
+  while (WiFi.status() != WL_CONNECTED) {
+
+    delay(100);
+    
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi connected!");
+
+  Serial.print("ESP32 IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+//FUNCTION: connectMQTT
+//Conencts the ESP32 to Adafruit IO. 
+void connectMQTT() {
+
+  //Keep attempting connection until successful.
+  while (!mqttClient.connected()) {
+
+    Serial.print("Connecting to Adafruit IO MQTT...");
+
+    //Give this ESP32 a unique MQTT client ID.
+    String clientId =
+      "ColdGuard-ESP32-" +
+      String(random(0xffff), HEX);
+
+  //Connect using:
+  //client ID
+  //Adafruit username
+  //Adafruit AIO key
+  if (
+    mqttClient.connect(
+      clientId.c_str(),
+      AIO_USERNAME,
+      AIO_KEY
+    )
+  ) {
+
+    Serial.println("connected!");
+  } else {
+
+    Serial.print("failed, MQTT state = ");
+    Serial.println(mqttClient.state());
+
+    Serial.println("Retrying in 5 seconds...");
+
+    delay(5000);
+  }
+ }
+}
+
+//EVENT TRACKING VARIABLES
+//Stores the previous values so ColdGuard can detect
+//when something has actually changed.
+bool previousDoorOpen = false;
+bool previousCoolingOn = false;
+bool previousDoorAlarm = false;
+
+//Prevents ColdGuard from creating fake "change"
+//events immediately when the ESP32 first starts.
+bool eventStateInitialised = false;
+
+void setup() {
+  //Start serial communication
+  Serial.begin(115200);
+
+  //Serial Monitor tells you ColdGuard
+  //has started before it attempts Wi-Fi/MQTT.
+  Serial.println("ColdGuard starting...");
+
+  //Configure the DHT sensor.
+  //DHT_PIN tells the library that the sensor is connected to GPIO 33.
+  //DHTesp::DHT22 tells the library that the sensor type is a DHT22.
+  dht.setup(DHT_PIN, DHTesp::DHT22);
+
+  //Configure GPIO 34 as an input.
+  //The ESP32 will read the analogue voltage
+  //produced by the LDR module on this pin. 
+  pinMode(LDR_PIN, INPUT);
+
+  //Configure the relay control pin as an output.
+  pinMode(RELAY_PIN, OUTPUT);
+
+  //Cooling starts OFF.
+  digitalWrite(RELAY_PIN, LOW);
+
+  //Configure the buzzer pin as an output.
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  //Buzzer starts turned off.
+  digitalWrite(BUZZER_PIN, LOW);
+
+  //Configure all three RGB LED channels as outputs.
+  pinMode(RGB_RED_PIN, OUTPUT);
+  pinMode(RGB_GREEN_PIN, OUTPUT);
+  pinMode(RGB_BLUE_PIN, OUTPUT);
+
+  //Start with the LED turned off.
+  setRGB(false, false, false);
+
+  //Initialise LCD
+  //Start communication with the LCD.
+  lcd.init();
+
+  //Turn the LCD blacklight.
+  lcd.backlight();
+
+  //Clear anything currently displayed.
+  lcd.clear();
+
+  //Start at column 0, row 0.
+  lcd.setCursor(0, 0);
+
+  //Display the ColdGuard name.
+  lcd.print("ColdGuard");
+
+  //Move to column 0, row 1.
+  lcd.setCursor(0, 1);
+
+  //Display startup status.
+  lcd.print("Starting...");
+
+  //WIFI + MQTT CONNECTION
+  //CONNECT TO WOKWI WIFI
+  //Connect the ESP32 to Wokwi-GUEST
+  //simulated Wi-Fi network.
+  connectWiFi();
+
+  //CONFIGURE MQTT
+  //Tell the MQTT client which MQTT broker
+  //ColdGuard will communicate with.
+  //MQTT_SERVER = io.adafruit.com
+  //MQTT_PORT = 8883
+  mqttClient.setServer(
+    MQTT_SERVER,
+    MQTT_PORT
+  );
+
+  //CONFIGURE TLS CONNECTION
+  //Allow the Wokwi ESP32 to establish the TLS
+  //connection without manually installing the
+  //Adafruit server certificate.
+  //This is convenient for the simulation.
+  wifiClient.setInsecure();
+
+  //Connect the MQTT client to Adafruit IO
+  //using the username and AIO key defined
+  //near the top of the program.
+  connectMQTT();
+
+
+  //Print a startup message once when the ESP32 starts.
+  Serial.println("Sensors, RGB LED, relay, buzzer and LCD initialised.");
+  Serial.println();
+}
+
+void loop() {
+
+//Connect to MQTT client for Adafruit.
+if (!mqttClient.connected()) {
+  connectMQTT();
+}
+
+mqttClient.loop();
+
+//Read both temperature nd humidity from the DHT22.
+//The results are stored together in a TempandHumidity structure
+//called "data".
+TempAndHumidity data = dht.getTempAndHumidity();
+
+//Read the analogue value from the photoresistor.
+//on ESP32, analogRead() normally gives a value
+//between 0 and 4095.
+//The exact value depends on how much light reaches
+//the photoresistor.
+int lightValue = analogRead(LDR_PIN);
+
+// if LDR value is below threshold
+//we assume light is entering the fridge
+//and therefore the door is open.
+bool doorOpen = lightValue < LDR_THRESHOLD;
+
+//DOOR OPEN TIMER
+//Check whether the fridge door is currently open.
+if (doorOpen) {
+
+  //if the door has only just opened,
+  //start the timer.
+  if (!doorTimerRunning) {
+
+    //millis() returns the number of milliseconds
+    //since the ESP32 started running.
+    doorOpenedAt = millis();
+
+    //Remember that the door timer is now active.
+    doorTimerRunning = true;
+
+    Serial.println("Door timer started.");
+  }
+} else {
+
+  //The door has been closed,
+  //so reset the timer.
+  doorTimerRunning = false;
+
+  //Reset the stored start time.
+  doorOpenedAt = 0;
+}
+
+//DOOR ALARM CONTROL
+//Start with the assumption that the
+//door alarm is not active.
+bool doorAlarm = false;
+
+//Only calculate elapsed time if:
+//1. The door is currently open
+//2. The timer has already started
+if (doorOpen && doorTimerRunning) {
+
+  //Calculate how long the door has been open.
+  //Example:
+  //Current millis() = 70000
+  //doorOpenedAt = 10000
+  //70000 - 10000 = 60000 ms
+  unsigned long doorOpenTime =
+      millis() - doorOpenedAt;
+
+      //If the door has remained open for at least
+      //60 seconds, activate the door alarm.
+      if (doorOpenTime >= DOOR_OPEN_LIMIT) {
+
+        doorAlarm = true;
+      }
+}
+
+//If the door alarm is active,
+//turn the buzzer on.
+if (doorAlarm) {
+
+  digitalWrite(BUZZER_PIN, HIGH); 
+} else {
+
+  //Otherwise keep the buzzer off.
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+
+//CLOSED-LOOP COOLING CONTROL
+//Only perform automatic cooling control
+//while fridge door is closed.
+if (!doorOpen) {
+
+  //If cooling is OFF and temperature reaches
+  //8.5°C or higher, activate cooling.
+  if (!coolingOn &&
+      data.temperature >= COOLING_ON_TEMP) {
+
+        coolingOn = true;
+
+        Serial.println("Cooling activated.");
+      }
+
+      //If cooling is already ON and temperature
+      //falls to 7.5°C or lower, deactivate cooling.
+      else if (coolingOn &&
+               data.temperature <= COOLING_OFF_TEMP) {
+
+                coolingOn = false;
+
+                Serial.println("Cooling deactivated.");
+               }
+}
+
+//Send the value stored in coolingOn to rhe relay.
+//coolingOn = true > HIGH > relay ON
+//coolingOn = false > LOW > relay OFF
+digitalWrite(RELAY_PIN, coolingOn ? HIGH : LOW);
+
+//RGB Status LOGIC
+if (doorOpen) {
+
+  //Door open = AMBER.
+  //Amber is created by turning on:
+  //Red + Green. 
+  //Blue remains off.
+  setRGB(true, true, false);
+} else {
+
+  //Door closed / normal = GREEN.
+  setRGB(false, true, false);
+}
+
+//Recent EVENTS
+//On the first loop, simply remember the current
+//states without publishing an event.
+if (!eventStateInitialised) {
+
+  previousDoorOpen = doorOpen;
+  previousCoolingOn = coolingOn;
+  previousDoorAlarm = doorAlarm;
+
+  eventStateInitialised = true;
+} else {
+
+  //DOOR EVENT
+  //Only run this if the door state has changed.
+  if (doorOpen != previousDoorOpen) {
+
+    if (doorOpen) {
+
+      publishEvent("Door opened");
+    } else {
+
+      publishEvent("Door closed");
+    }
+
+    //Remember the new door state.
+    previousDoorOpen = doorOpen;
+  }
+
+//COOLING EVENT
+//Only run this if cooling has changed ON/OFF.
+if (coolingOn != previousCoolingOn) {
+
+  if (coolingOn) {
+
+    publishEvent("Cooling Activated");
+  } else {
+
+    publishEvent("Cooling deactivated");
+  }
+
+  //Remember the new cooling state.
+  previousCoolingOn = coolingOn;
+}
+
+//DOOR ALARM EVENT
+//Only run this if the door alarm state changes.
+if (doorAlarm != previousDoorAlarm) {
+
+  if (doorAlarm) {
+
+    publishEvent("Door alarm activated");
+  } else {
+
+    publishEvent("Door alarm cleared");
+  }
+
+  //Remember the new alarm state.
+  previousDoorAlarm = doorAlarm;
+}
+}
+
+if (millis() - lastSensorUpdate >= SENSOR_INTERVAL) {
+
+lastSensorUpdate = millis();
+//UPDATE LCD DISPLAY
+//Clear the LCD before writing new information.
+//This is simple for now. 
+//This can be improved later on to avoid flickering.
+lcd.clear();
+
+//LCD Row 1
+//Start at column 0, row 0..
+lcd.setCursor(0, 0);
+
+//Display temperature.
+lcd.print("T:");
+lcd.print(data.temperature, 1);
+lcd.print("C");
+
+//Add some spacing.
+lcd.print(" H:");
+
+//Display humidity.
+lcd.print(data.humidity, 0);
+lcd.print("%");
+
+//LCD ROW 2
+// Start at column 0, row 1.
+lcd.setCursor(0, 1);
+
+//Display door state.
+if (doorOpen) {
+
+  lcd.print("Door:OPEN ");
+} else {
+
+  lcd.print("Door:CLOSED");
+}
+
+//Display cooling indicator.
+if (coolingOn) {
+
+  lcd.print(" C");
+} else {
+
+  lcd.print(" -");
+}
+
+//print the temperature value.
+//data.temperature contains the temperature in degrees Celsius.
+// The 1 displays the value to one decimal place. 
+Serial.print("Temperature: ");
+Serial.print(data.temperature, 1);
+Serial.println (" C");
+
+//print the humidity unit and move to the next line.
+Serial.print("Humidity: ");
+Serial.print(data.humidity, 1);
+Serial.println(" %");
+
+//Print LDR Value
+Serial.print("LDR value: ");
+
+//Print the raw analogue value coming
+//from GPIO 34.
+Serial.println(lightValue);
+
+//Print Door State
+Serial.print("Door: ");
+
+if (doorOpen) {
+
+  //This runs when the LDR detects enough light
+  //to indicate that the fridge door is open.
+  Serial.println("OPEN");
+} else {
+
+  //This runs when the LDR is dark enough
+  //to indicate that the fridge door is closed.
+  Serial.println("CLOSED");
+}
+
+//PRINT DOOR TIMER STATUS
+Serial.print("Door Alarm: ");
+
+if (doorAlarm) {
+
+  Serial.println("ACTIVE");
+} else {
+
+  Serial.println("OFF");
+}
+
+//PRINT COOLING STATUS
+Serial.print("Cooling: ");
+
+if (coolingOn) {
+
+  Serial.println("ON");
+} else {
+
+  Serial.println("OFF");
+}
+
+//PRINT LED STATE
+Serial.print("Status LED: ");
+
+if (doorOpen) {
+
+  Serial.println("AMBER");
+} else{
+
+  Serial.println("GREEN");
+}
+
+//Separator to make each sensor reading easier to see.
+Serial.println("----------------");
+
+} // CLOSES 2-SECOND SENSOR/LCD/SERIAL BLOCK
+
+//MQTT DASHBOARD PUBLISH TIMER
+//Publish dashboard telemetry every 15 seconds.
+if (millis() - lastMqttPublish >= MQTT_PUBLISH_INTERVAL) {
+
+  lastMqttPublish = millis();
+
+  //Publish Temperature to Adafruit IO.
+//Convert the temperature value into text.
+//Example: 9.0 becomes "9.0"
+char temperatureValue[8];
+
+dtostrf(
+  data.temperature,
+  1,
+  1,
+  temperatureValue
+);
+
+//Publish the temperature to Adafruit
+//temperature feed.
+bool publishSuccess =
+  mqttClient.publish(
+    temperatureTopic.c_str(),
+    temperatureValue
+  );
+
+//Print whether MQTT publishing worked.
+if (publishSuccess) {
+
+  Serial.print("MQTT Temperature published: ");
+  Serial.println(temperatureValue);
+} else {
+
+  Serial.println("MQTT Temperature publish FAILED");
+}
+
+//Publish Humidity to Adafruit IO.
+//Convert the humidity value into text.
+//Example: 80.0 becomes "80.0"
+char humidityValue[10];
+
+dtostrf(
+  data.humidity,
+  1,
+  1,
+  humidityValue
+);
+
+//Publish humidity to the Adafruit
+//humidity feed.
+bool humidityPublishSuccess =
+  mqttClient.publish(
+    humidityTopic.c_str(),
+    humidityValue
+  );
+
+//Print whether humidity publishing worked.
+if (humidityPublishSuccess) {
+
+  Serial.print("MQTT Humidity publish: ");
+  Serial.println(humidityValue);
+} else {
+
+  Serial.println("MQTT Humidity publish FAILED");
+}
+
+//PUBLISH DOOR STATUS TO ADAFRUIT IO
+//Convert the door state into a simple number
+// 1 = door open
+// 0 = door closed
+const char* doorValue;
+
+if (doorOpen) {
+
+  doorValue = "1";
+
+} else {
+
+  doorValue = "0";
+}
+
+//Publish door status to Adafruit IO.
+bool doorPublishSuccess = 
+  mqttClient.publish(
+    doorTopic.c_str(),
+    doorValue
+  );
+
+//Print whether door status publishing worked.
+if (doorPublishSuccess) {
+
+  Serial.print("MQTT Door published: ");
+  Serial.println(doorValue);
+} else {
+
+  Serial.println("MQTT door publish FAILED");
+}
+
+//PUBLISH COOLING / RELAY STATUS TO ADAFRUIT IO
+//Convert cooling state into a simple number.
+// 1 = cooling ON
+// 0 = cooling OFF
+const char* relayValue;
+
+if (coolingOn) {
+
+  relayValue = "1";
+} else {
+
+  relayValue = "0";
+}
+
+//Publish the actual cooling/relay state.
+bool relayPublishSuccess = 
+  mqttClient.publish(
+    relayTopic.c_str(),
+    relayValue
+  );
+
+//Print whether relay status publishing worked.
+if (relayPublishSuccess) {
+
+  Serial.print("MQTT Relay published: ");
+  Serial.println(relayValue);
+} else {
+
+  Serial.println("MQTT Relay publish FAILED");
+}
+
+//TEMPORARY SYSTEM STATE
+//This is a simple dashboard status for now.
+//Will replace this later with the proper FSM.
+const char* systemState;
+
+if (doorOpen) {
+  systemState = "DOOR_OPEN";
+} else if (coolingOn) {
+
+  systemState = "COOLING";
+} else {
+
+  systemState = "NORMAL";
+}
+
+//PUBLISH SYSTEM STATE TO ADAFRUIT IO
+bool statePublishSuccess = 
+  mqttClient.publish(
+    stateTopic.c_str(),
+    systemState
+  );
+
+if (statePublishSuccess) {
+
+  Serial.print("MQTT State published: ");
+  Serial.println(systemState);
+} else {
+  Serial.println("MQTT State publish FAILED");
+}
+
+//TEMPORARY SYSTEM FAULT CHECK
+//Start by assuming there is no fault.
+bool systemFault = false;
+
+//Check whether the DHT22 returned an invalid value.
+if (isnan(data.temperature) || isnan(data.humidity)) {
+
+  systemFault = true;
+}
+
+//COVERT FAULT STATE FOR MQTT
+// 1 = fault detected
+// 0 = no fault
+const char* faultValue;
+
+if (systemFault) {
+
+  faultValue = "1";
+} else {
+
+  faultValue = "0";
+}
+
+//PUBLISH SYSTEM FAULT to ADAFRUIT IO
+bool faultPublishSuccess =
+  mqttClient.publish(
+    faultTopic.c_str(),
+    faultValue
+  );
+
+if (faultPublishSuccess) {
+
+  Serial.print("MQTT Fault published: ");
+  Serial.println(faultValue);
+} else {
+
+  Serial.println("MQTT Fault publish FAILED");
+}
+
+//Seperator to make each sensor reading easier to see.
+Serial.println("----------------");
+
+}//Closes 15-second MQTT block
+
+}//Closes loop()
