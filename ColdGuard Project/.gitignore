@@ -1,0 +1,8 @@
+# ColdGuard private credentials
+**/secrets.h
+
+#PlatformIO generated files
+**/.pio/
+
+# VS Code local settings
+**/.vscode/
