@@ -126,6 +126,14 @@ const float Z_SCORE_DRIFT_THRESHOLD = 2.0;
 //per minute or greater is considered a meaningful trend.
 const float SLOPE_DRIFT_THRESHOLD = 0.5;
 
+//HIGH HUMIDITY THRESHOLD
+//Humidity is monitored as an environmental condition.
+//
+//Humidity does NOT directly control the refrigeration relay.
+//Instead, high humidity contributes to ColdGuard's
+//edge-intelligence DRIFTING classification.
+const float HIGH_HUMIDITY_THRESHOLD = 75.0;
+
 //MQTT PUBLISH Timer
 //Stores the last time dashboard telemetry
 //was published to Adafruit IO.
@@ -703,6 +711,11 @@ bool previousDoorOpen = false;
 bool previousCoolingOn = false;
 bool previousDoorAlarm = false;
 
+//Stores the previous high-humidity condition
+//so ColdGuard can publish an event only when
+//the condition changes.
+bool previousHighHumidity = false;
+
 //Stores the previous excursion state so ColdGuard
 //can publish an event when an excursion starts or clears.
 bool previousExcursionLatched = false;
@@ -888,6 +901,18 @@ bool sensorFault =
   data.temperature < PLAUSIBLE_MIN_TEMP ||
   data.temperature > PLAUSIBLE_MAX_TEMP;
 
+//HIGH HUMIDITY MONITORING
+//
+//Humidity above 75% RH is treated as an abnormal
+//Environmental condition.
+//
+//This does NOT directly activate the cooling relay.
+//It is used by the edge-intelligence system to
+//identify abnormal environmental behaviour.
+bool highHumidity =
+  !sensorFault &&
+  data.humidity > HIGH_HUMIDITY_THRESHOLD;
+
 //DOOR OPEN TIMER
 //Check whether the fridge door is currently open.
 if (doorOpen) {
@@ -1004,7 +1029,7 @@ if (doorAlarm) {
 //Only monitor temperature excursions while: 
 //1. The sensor is valid.
 //2. The fridge door is closed.
-if (!sensorFault && !doorOpen) {
+if (!sensorFault) {
 
   //Start the high-temperature timer when
   //temperature rises above the safe maximum.
@@ -1323,6 +1348,7 @@ if (!eventStateInitialised) {
   previousDoorOpen = doorOpen;
   previousCoolingOn = coolingOn;
   previousDoorAlarm = doorAlarm;
+  previousHighHumidity = highHumidity;
   previousExcursionLatched = excursionLatched;
   previousSensorFault = sensorFault;
 
@@ -1375,6 +1401,25 @@ if (doorAlarm != previousDoorAlarm) {
 
   //Remember the new alarm state.
   previousDoorAlarm = doorAlarm;
+}
+
+//HIGH HUMIDIDITY EVENT
+//Only publish an event when the high-humidity
+//condition changes
+if (highHumidity != previousHighHumidity) {
+
+  if (highHumidity) {
+
+    publishEvent("High humidity detected");
+  } else{
+
+    publishEvent("Humidity returned to normal");
+  }
+
+//IMPORTANT: 
+//Remember the new humidity condition AFTER 
+//processing the change.
+previousHighHumidity = highHumidity;
 }
 
 //EXCURSION EVENT
@@ -1495,11 +1540,15 @@ else if (
   //1.The temperature is above the normal safe maximum,
   //but the FSM has not yet declared an EXCURSION.
   //
-  //2.The Z-score shows statistcally unusual behaviour.
+  //2. Humidity is above the configured 75% RH
+  //environmental threshold.
   //
-  //3.The temperature is changing faster than our
+  //3.The Z-score shows statistcally unusual behaviour.
+  //
+  //4.The temperature is changing faster than our
   //configured slope threshold.
   data.temperature > SAFE_MAX_TEMP ||
+  highHumidity ||
   fabs(temperatureZScore) >= Z_SCORE_DRIFT_THRESHOLD ||
   fabs(temperatureSlope) >= SLOPE_DRIFT_THRESHOLD
 ) {
@@ -1944,3 +1993,4 @@ Serial.println("----------------");
 }//Closes 15-second MQTT block
 
 }//Closes loop()
+
